@@ -116,7 +116,7 @@ class Pipex:
                                 if filedata:
                                     client.sendall(filedata.encode())
                         else:
-                            filename = input("Enter filename to upload: ").strip()
+                            filename = input("Enter new filename to upload: ").strip()
                             client.sendall((filename + "\n").encode())
                             print("Enter file content (end with EOF/Ctrl+D):")
                             filedata = sys.stdin.read()
