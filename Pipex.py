@@ -13,10 +13,17 @@ from typing import Optional
 from colorama import Fore, Style, init
 import os
 
-# Setup logging and colorama
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-init(autoreset=True)
+# Initialize colorama
+init()
+
+# Configure logger
+logger = logging.getLogger("pipex")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 
 class Pipex:
     def __init__(self):
@@ -25,8 +32,12 @@ class Pipex:
         self.validate_args()
 
     class SecureSocketWrapper:
-        def __init__(self, sock: socket.socket, ssl_context: Optional[ssl.SSLContext] = None,
-                     server_side: bool = False):
+        def __init__(
+            self,
+            sock: socket.socket,
+            ssl_context: Optional[ssl.SSLContext] = None,
+            server_side: bool = False,
+        ):
             self.sock = sock
             self.ssl_context = ssl_context
             self.server_side = server_side
@@ -34,9 +45,7 @@ class Pipex:
         def __enter__(self):
             if self.ssl_context:
                 self.sock = self.ssl_context.wrap_socket(
-                    self.sock,
-                    server_side=self.server_side,
-                    suppress_ragged_eofs=True
+                    self.sock, server_side=self.server_side, suppress_ragged_eofs=True
                 )
             return self.sock
 
@@ -58,39 +67,57 @@ class Pipex:
         parser.add_argument('-l', '--listen', action='store_true', help='Listen mode')
         parser.add_argument('-e', '--execute', help='Execute command')
         parser.add_argument('-c', '--command', action='store_true', help='Command shell')
-        parser.add_argument('-u', '--upload', help='Upload directory')
-        parser.add_argument('--ssl', action='store_true', help='Use SSL/TLS')
-        parser.add_argument('--cert', help='SSL certificate file')
-        parser.add_argument('--key', help='SSL private key file')
-        parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-        parser.add_argument('-T', '--timeout', type=int, default=30, help='Connection timeout')
+        parser.add_argument(
+            '-u',
+            '--upload',
+            help='Upload a file (client) or specify upload directory (server)',
+        )
+        parser.add_argument('--ssl', action='store_true', help='Enable SSL/TLS')
+        parser.add_argument('--cert', help='Path to SSL certificate (.crt)')
+        parser.add_argument('--key', help='Path to SSL private key (.key)')
+        parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
+        parser.add_argument(
+            '--timeout',
+            type=float,
+            default=5.0,
+            help='Timeout for socket operations (seconds)',
+        )
         return parser.parse_args()
 
-    def configure_logging(self):
-        level = logging.DEBUG if self.args.verbose else logging.INFO
-        logger.setLevel(level)
-
     def validate_args(self):
-        if not self.args.listen and not self.args.target:
-            logger.error("Target host required in client mode")
-            sys.exit(1)
-        if self.args.ssl and (not self.args.cert or not self.args.key):
-            logger.error("SSL requires both certificate and private key")
-            sys.exit(1)
+        # If SSL is requested, both cert and key must be provided and exist
         if self.args.ssl:
-            # Check if the cert and key files exist
+            if not (self.args.cert and self.args.key):
+                logger.error("SSL requires both certificate and private key")
+                sys.exit(1)
             if not Path(self.args.cert).is_file() or not Path(self.args.key).is_file():
                 logger.error("SSL certificate or key file not found")
                 sys.exit(1)
+
+        # Cannot use execute and command simultaneously in listen mode
+        if self.args.listen and self.args.execute and self.args.command:
+            logger.error("Cannot use both --execute and --command simultaneously")
+            sys.exit(1)
+
+        # If not listening, target must be specified
+        if not self.args.listen and not self.args.target:
+            logger.error("Target IP must be specified in client mode")
+            sys.exit(1)
+
+    def configure_logging(self):
+        if self.args.verbose:
+            logger.setLevel(logging.DEBUG)
+        else:
+            logger.setLevel(logging.INFO)
 
     def create_ssl_context(self) -> ssl.SSLContext:
         purpose = ssl.Purpose.CLIENT_AUTH if self.args.listen else ssl.Purpose.SERVER_AUTH
         context = ssl.create_default_context(purpose)
         if self.args.cert and self.args.key:
             context.load_cert_chain(certfile=self.args.cert, keyfile=self.args.key)
-        # For demonstration, disable hostname checking on client side.
-        context.verify_mode = ssl.CERT_NONE if not self.args.listen else ssl.CERT_REQUIRED
+        # Disable hostname checking and certificate verification for both ends
         context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
         return context
 
     def client_sender(self, buffer: str):
@@ -106,35 +133,70 @@ class Pipex:
 
                     # -- UPLOAD MODE --
                     if self.args.upload:
-                        if buffer:
-                            # Expect piped input: first line is filename, rest is file data.
-                            lines = buffer.splitlines()
-                            if lines:
-                                filename = lines[0].strip()
-                                filedata = "\n".join(lines[1:]) if len(lines) > 1 else ""
+                        # 1) If the upload path is a local file, read & send it automatically
+                        if os.path.isfile(self.args.upload):
+                            local_path = self.args.upload
+                            remote_filename = Path(local_path).name.encode()
+                            with open(local_path, "rb") as f:
+                                filebytes = f.read()
+                            # Send "<filename>\n<filebytes>"
+                            client.sendall(remote_filename + b"\n" + filebytes)
+                            # Read single response from server
+                            response = b""
+                            while True:
+                                r, _, _ = select.select([client], [], [], 2)
+                                if r:
+                                    part = client.recv(4096)
+                                    if not part:
+                                        break
+                                    response += part
+                                else:
+                                    break
+                            print(response.decode(), end="")
+                            return
+
+                        # 2) If piped data exists, treat first line as filename, rest as file data
+                        elif buffer:
+                            lines_buf = buffer.splitlines()
+                            if lines_buf:
+                                filename = lines_buf[0].strip()
+                                filedata = "\n".join(lines_buf[1:]) if len(lines_buf) > 1 else ""
                                 client.sendall((filename + "\n").encode())
                                 if filedata:
                                     client.sendall(filedata.encode())
+                                # Read response
+                                response = b""
+                                while True:
+                                    r, _, _ = select.select([client], [], [], 2)
+                                    if r:
+                                        part = client.recv(4096)
+                                        if not part:
+                                            break
+                                        response += part
+                                    else:
+                                        break
+                                print(response.decode(), end="")
+                                return
+
+                        # 3) No local file or piped input: prompt interactively
                         else:
                             filename = input("Enter new filename to upload: ").strip()
                             client.sendall((filename + "\n").encode())
                             print("Enter file content (end with EOF/Ctrl+D):")
                             filedata = sys.stdin.read()
                             client.sendall(filedata.encode())
-
-                        # Read response using select
-                        response = b""
-                        while True:
-                            r, _, _ = select.select([client], [], [], 2)
-                            if r:
-                                part = client.recv(4096)
-                                if not part:
+                            response = b""
+                            while True:
+                                r, _, _ = select.select([client], [], [], 2)
+                                if r:
+                                    part = client.recv(4096)
+                                    if not part:
+                                        break
+                                    response += part
+                                else:
                                     break
-                                response += part
-                            else:
-                                break
-                        print(response.decode(), end="")
-                        return
+                            print(response.decode(), end="")
+                            return
 
                     # -- NON-UPLOAD MODE WITH PIPED INPUT --
                     if buffer:
@@ -194,7 +256,8 @@ class Pipex:
 
     def server_loop(self):
         context = self.create_ssl_context() if self.args.ssl else None
-        bind_ip = '0.0.0.0' if not self.args.target else self.args.target
+        bind_ip = "0.0.0.0" if not self.args.target else self.args.target
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((bind_ip, self.args.port))
@@ -202,134 +265,158 @@ class Pipex:
             logger.info(f"Listening on {bind_ip}:{self.args.port}")
 
             while True:
-                client_sock, addr = server.accept()
-                logger.info(f"Accepted connection from {addr}")
-                client_thread = threading.Thread(
-                    target=self.client_handler,
-                    args=(client_sock, addr, context),
-                    daemon=True
-                )
-                client_thread.start()
+                try:
+                    client_socket, addr = server.accept()
+                    logger.info(f"Accepted connection from {addr}")
+                    handler_thread = threading.Thread(
+                        target=self.client_handler, args=(client_socket,)
+                    )
+                    handler_thread.daemon = True
+                    handler_thread.start()
+                except Exception as e:
+                    logger.error(f"Server error: {str(e)}")
+                    break
 
-    def client_handler(self, client_socket, addr, context):
+    def client_handler(self, client_socket: socket.socket):
+        context = self.create_ssl_context() if self.args.ssl else None
+        if context:
+            try:
+                client_socket = context.wrap_socket(client_socket, server_side=True)
+            except ssl.SSLError as e:
+                logger.error(f"SSL handshake failed: {str(e)}")
+                client_socket.close()
+                return
+
         try:
-            logger.debug(f"Handling connection from {addr}")
-            with self.SecureSocketWrapper(client_socket, context, server_side=True) as client:
-                # Use a timeout on the client socket as specified.
-                client.settimeout(self.args.timeout)
-                if self.args.upload:
-                    self.handle_upload(client)
-                elif self.args.execute:
-                    self.handle_execute(client)
-                elif self.args.command:
-                    self.handle_command_shell(client)
-                else:
-                    logger.debug("No action specified for connection")
-                    client.sendall(b"No action specified. Closing connection.\r\n")
+            # If upload flag is set, handle file upload
+            if self.args.upload:
+                self.handle_upload(client_socket)
+                return
+
+            # If execute flag is set, run a single command
+            if self.args.execute:
+                self.handle_execute(client_socket, self.args.execute)
+                return
+
+            # If command flag is set, start interactive shell
+            if self.args.command:
+                self.handle_command_shell(client_socket)
+                return
+
+            # Otherwise, if any data is piped to listener, echo it back
+            buffer = client_socket.recv(4096).decode()
+            if buffer:
+                client_socket.send(buffer.encode())
         except Exception as e:
-            logger.error(f"Handler error from {addr}: {str(e)}")
+            logger.error(f"Handler error: {str(e)}")
         finally:
-            logger.debug(f"Closing connection from {addr}")
             client_socket.close()
 
     def handle_upload(self, client: socket.socket):
-        try:
-            client.settimeout(self.args.timeout)
-            # Read filename (first line)
-            file_name = client.recv(4096).decode().strip()
-            if not file_name:
-                raise ValueError("No filename provided")
-            upload_dir = Path(self.args.upload).resolve()
-            file_path = (upload_dir / file_name).resolve()
-            if not str(file_path).startswith(str(upload_dir)):
-                raise ValueError("Invalid file path")
-            with open(file_path, 'wb') as f:
-                while True:
-                    try:
-                        data = client.recv(4096)
-                        if not data:
-                            break
-                        f.write(data)
-                    except (socket.timeout, BlockingIOError):
-                        break
-            client.sendall(b"File upload successful")
-        except Exception as e:
-            err_msg = f"Upload error: {str(e)}"
-            logger.error(err_msg)
+        # Read incoming data until timeout or zero-length read
+        data = b""
+        while True:
             try:
-                client.sendall(err_msg.encode())
+                r, _, _ = select.select([client], [], [], 2)
+                if r:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                else:
+                    break
             except Exception:
-                pass
+                break
 
-    def handle_execute(self, client: socket.socket):
+        if not data:
+            client.sendall(b"ERROR: No data received.\n")
+            return
+
+        parts = data.split(b"\n", 1)
+        if len(parts) < 2 or not parts[0]:
+            client.sendall(b"ERROR: Filename missing.\n")
+            return
+        filename = parts[0].decode().strip()
+        file_bytes = parts[1]
+
+        remote_dir = Path(self.args.upload)
+        try:
+            if not remote_dir.exists():
+                remote_dir.mkdir(parents=True, exist_ok=True)
+            target_path = (remote_dir / filename).resolve()
+            if not str(target_path).startswith(str(remote_dir.resolve())):
+                raise ValueError("Invalid file path.")
+            with open(target_path, "wb") as f:
+                f.write(file_bytes)
+            client.sendall(f"Upload of '{filename}' successful.\n".encode())
+            logger.info(f"Saved upload to {target_path}")
+        except Exception as e:
+            client.sendall(f"ERROR: {str(e)}\n".encode())
+
+    def handle_execute(self, client: socket.socket, command: str):
         try:
             process = subprocess.Popen(
-                self.args.execute, shell=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE, text=True
+                command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            stdout, stderr = process.communicate(timeout=self.args.timeout)
+            stdout, stderr = process.communicate(timeout=30)
             output = stdout + stderr
-            client.sendall(output.encode())
-        except subprocess.SubprocessError as e:
-            err_msg = f"Execution error: {str(e)}"
-            logger.error(err_msg)
-            client.sendall(err_msg.encode())
+            client.sendall(output)
+        except Exception as e:
+            client.sendall(f"ERROR: {str(e)}\n".encode())
 
     def handle_command_shell(self, client: socket.socket):
-        # Send an initial banner.
-        client.sendall(b"pipex Interactive Shell:\n")
-        process = subprocess.Popen(
-            ["/bin/bash"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1  # line buffered
+        client.sendall(b"*** Pipex Interactive Shell ***\n")
+        shell = subprocess.Popen(
+            ["/bin/bash"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
 
-        def forward_output(src):
-            try:
-                for line in iter(src.readline, ''):
-                    if not line:
-                        break
-                    try:
-                        client.sendall(line.encode())
-                    except Exception:
-                        break
-            except Exception as e:
-                logger.error(f"Error reading shell output: {str(e)}")
-
-        threading.Thread(target=forward_output, args=(process.stdout,), daemon=True).start()
-        threading.Thread(target=forward_output, args=(process.stderr,), daemon=True).start()
-
-        try:
+        def read_from_process(pipe):
             while True:
-                data = client.recv(1024).decode()
+                data = pipe.readline()
                 if not data:
                     break
-                if data.strip().lower() == "exit":
-                    client.sendall(b"Exiting command shell.\n")
-                    process.terminate()
+                try:
+                    client.sendall(data)
+                except Exception:
                     break
-                process.stdin.write(data + "\n")
-                process.stdin.flush()
-        except Exception as e:
-            logger.error(f"Shell input error: {str(e)}")
-            process.terminate()
+
+        stdout_thread = threading.Thread(
+            target=read_from_process, args=(shell.stdout,)
+        )
+        stderr_thread = threading.Thread(
+            target=read_from_process, args=(shell.stderr,)
+        )
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+
+        while True:
+            try:
+                cmd = client.recv(4096).decode().strip()
+                if not cmd or cmd.lower() == "exit":
+                    shell.kill()
+                    break
+                shell.stdin.write((cmd + "\n").encode())
+                shell.stdin.flush()
+            except Exception:
+                break
+
+        shell.terminate()
+        client.close()
 
     def run(self):
         if self.args.listen:
             self.server_loop()
         else:
-            if sys.stdin.isatty():
-                self.client_sender("")
-            else:
+            # Read any piped data from stdin
+            buffer = ""
+            if not sys.stdin.isatty():
                 buffer = sys.stdin.read()
-                self.client_sender(buffer)
+            self.client_sender(buffer)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         Pipex().run()
     except KeyboardInterrupt:
